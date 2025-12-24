@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import * as Slider from "@radix-ui/react-slider";
+import * as Progress from "@radix-ui/react-progress";
 
 export default function VideoRecorder() {
   const videoRef = useRef(null);
@@ -11,6 +13,11 @@ export default function VideoRecorder() {
 
   const audioContextRef = useRef(null);
   const audioDestinationRef = useRef(null);
+  const gainNodeRef = useRef(null);
+  const analyserRef = useRef(null);
+  const meterRafRef = useRef(null);
+  const lastClipAtMsRef = useRef(0);
+  const meterLastUiUpdateMsRef = useRef(0);
 
   const [isReady, setIsReady] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
@@ -19,8 +26,27 @@ export default function VideoRecorder() {
   const [isInitializing, setIsInitializing] = useState(false);
   const [previewFitMode, setPreviewFitMode] = useState("contain"); // "contain" | "cover"
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [gainDb, setGainDb] = useState(3.5); // ~1.5x linear (previous default)
+  const [rms, setRms] = useState(0);
+  const [peak, setPeak] = useState(0);
+  const [isClipping, setIsClipping] = useState(false);
+  const [isAudioMeterEnabled, setIsAudioMeterEnabled] = useState(false);
 
   const supportsMediaRecorder = typeof window !== "undefined" && "MediaRecorder" in window;
+
+  function dbToLinear(db) {
+    return Math.pow(10, db / 20);
+  }
+
+  function ampToDbfs(amp) {
+    if (!Number.isFinite(amp) || amp <= 0) return Number.NEGATIVE_INFINITY;
+    return 20 * Math.log10(amp);
+  }
+
+  function formatDb(db) {
+    if (!Number.isFinite(db)) return "-∞";
+    return db.toFixed(1);
+  }
 
   const formattedTime = useMemo(() => {
     const mm = String(Math.floor(elapsedSec / 60)).padStart(2, "0");
@@ -75,6 +101,10 @@ export default function VideoRecorder() {
   }
 
   function cleanupAudioGraph() {
+    if (meterRafRef.current) {
+      cancelAnimationFrame(meterRafRef.current);
+      meterRafRef.current = null;
+    }
     try {
       if (audioContextRef.current) {
         audioContextRef.current.close().catch(() => {});
@@ -84,6 +114,87 @@ export default function VideoRecorder() {
     } finally {
       audioContextRef.current = null;
       audioDestinationRef.current = null;
+      gainNodeRef.current = null;
+      analyserRef.current = null;
+      lastClipAtMsRef.current = 0;
+      meterLastUiUpdateMsRef.current = 0;
+      setIsAudioMeterEnabled(false);
+      setRms(0);
+      setPeak(0);
+      setIsClipping(false);
+    }
+  }
+
+  function startMeterLoop() {
+    if (meterRafRef.current) return;
+    const analyser = analyserRef.current;
+    if (!analyser) return;
+
+    const hasFloat = typeof analyser.getFloatTimeDomainData === "function";
+    const floatBuf = hasFloat ? new Float32Array(analyser.fftSize) : null;
+    const byteBuf = !hasFloat ? new Uint8Array(analyser.fftSize) : null;
+
+    const tick = () => {
+      const a = analyserRef.current;
+      if (!a) return;
+
+      let localPeak = 0;
+      let sumSq = 0;
+
+      if (floatBuf) {
+        a.getFloatTimeDomainData(floatBuf);
+        for (let i = 0; i < floatBuf.length; i += 1) {
+          const v = floatBuf[i];
+          const av = Math.abs(v);
+          if (av > localPeak) localPeak = av;
+          sumSq += v * v;
+        }
+      } else if (byteBuf) {
+        a.getByteTimeDomainData(byteBuf);
+        for (let i = 0; i < byteBuf.length; i += 1) {
+          const v = (byteBuf[i] - 128) / 128;
+          const av = Math.abs(v);
+          if (av > localPeak) localPeak = av;
+          sumSq += v * v;
+        }
+      }
+
+      const localRms = Math.sqrt(sumSq / Math.max(1, analyser.fftSize));
+
+      const now = performance.now();
+      if (localPeak >= 0.98) lastClipAtMsRef.current = now;
+      const clipHold = now - lastClipAtMsRef.current < 900;
+
+      // Throttle UI updates to avoid excessive renders
+      if (now - meterLastUiUpdateMsRef.current > 50) {
+        meterLastUiUpdateMsRef.current = now;
+        setRms(localRms);
+        setPeak(localPeak);
+        setIsClipping(clipHold);
+      }
+
+      meterRafRef.current = requestAnimationFrame(tick);
+    };
+
+    meterRafRef.current = requestAnimationFrame(tick);
+  }
+
+  async function enableAudioMeter() {
+    try {
+      const rawStream = streamRef.current;
+      if (!rawStream) return;
+      ensureAudioGraph(rawStream);
+
+      if (audioContextRef.current?.state === "suspended") {
+        await audioContextRef.current.resume().catch(() => {});
+      }
+
+      if (audioContextRef.current?.state === "running") {
+        setIsAudioMeterEnabled(true);
+        startMeterLoop();
+      }
+    } catch {
+      // ignore; meter is optional
     }
   }
 
@@ -110,6 +221,7 @@ export default function VideoRecorder() {
 
     // Cleanup any prior stream
     cleanupStreamOnly();
+    cleanupAudioGraph();
 
     try {
       if (!navigator.mediaDevices?.getUserMedia) {
@@ -142,6 +254,9 @@ export default function VideoRecorder() {
         await videoRef.current.play().catch(() => {});
       }
 
+      // Prepare audio graph for gain control + meter (may remain suspended until user gesture)
+      ensureAudioGraph(stream);
+
       setIsReady(true);
     } catch (e) {
       const msg =
@@ -157,7 +272,11 @@ export default function VideoRecorder() {
     }
   }
 
-  function makeProcessedAudioStream(rawStream) {
+  function ensureAudioGraph(rawStream) {
+    if (audioContextRef.current && audioDestinationRef.current && gainNodeRef.current && analyserRef.current) {
+      return audioDestinationRef.current.stream;
+    }
+
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     if (!AudioCtx) throw new Error("Web Audio API (AudioContext) is not supported in this browser.");
 
@@ -180,14 +299,21 @@ export default function VideoRecorder() {
     compressor.release.value = 0.25;
 
     const gain = ctx.createGain();
-    gain.gain.value = 1.5;
+    gain.gain.value = dbToLinear(gainDb);
+    gainNodeRef.current = gain;
+
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.2;
+    analyserRef.current = analyser;
 
     const destination = ctx.createMediaStreamDestination();
     audioDestinationRef.current = destination;
 
-    // Pipeline: mic -> compressor -> gain -> destination
+    // Pipeline: mic -> compressor -> gain -> (analyser + destination)
     source.connect(compressor);
     compressor.connect(gain);
+    gain.connect(analyser);
     gain.connect(destination);
 
     return destination.stream;
@@ -227,10 +353,11 @@ export default function VideoRecorder() {
       const videoTrack = rawStream.getVideoTracks()[0];
       if (!videoTrack) throw new Error("No camera track available.");
 
-      cleanupAudioGraph();
+      // Ensure audio graph exists + meter can run (some browsers require a user gesture to start audio)
+      await enableAudioMeter();
 
-      // Build processed audio (must be created on a user gesture in some browsers)
-      const processedAudioStream = makeProcessedAudioStream(rawStream);
+      // Build/Reuse processed audio
+      const processedAudioStream = ensureAudioGraph(rawStream);
 
       // Combine camera video + processed audio into a new stream for recording
       const composedStream = new MediaStream([videoTrack, ...processedAudioStream.getAudioTracks()]);
@@ -290,9 +417,6 @@ export default function VideoRecorder() {
         chunksRef.current = [];
 
         triggerDownload(blob, finalMime);
-
-        // Tear down audio graph (preview stays)
-        cleanupAudioGraph();
       };
 
       recorder.start(250); // timeslice for steady chunking
@@ -316,6 +440,20 @@ export default function VideoRecorder() {
       // ignore
     }
   }
+
+  useEffect(() => {
+    const ctx = audioContextRef.current;
+    const gain = gainNodeRef.current;
+    if (!ctx || !gain) return;
+
+    // Smooth gain changes to avoid clicks.
+    const next = dbToLinear(gainDb);
+    try {
+      gain.gain.setTargetAtTime(next, ctx.currentTime, 0.01);
+    } catch {
+      gain.gain.value = next;
+    }
+  }, [gainDb]);
 
   useEffect(() => {
     initMedia();
@@ -362,6 +500,8 @@ export default function VideoRecorder() {
 
   const canStart = isReady && !isRecording && !isInitializing && supportsMediaRecorder;
   const canStop = isRecording;
+  const rmsPct = Math.max(0, Math.min(100, rms * 100));
+  const peakPct = Math.max(0, Math.min(100, peak * 100));
 
   return (
     <div className="relative h-[100dvh] w-full bg-neutral-950 text-neutral-100">
@@ -427,9 +567,92 @@ export default function VideoRecorder() {
       <div className="absolute inset-x-0 bottom-0 z-10 p-4 pb-6">
         <div className="mx-auto w-full max-w-3xl">
           <div className="rounded-2xl bg-black/45 p-4 ring-1 ring-white/10 backdrop-blur">
+            {/* Audio controls */}
+            {isReady && (
+              <div className="mb-4 rounded-2xl bg-white/5 p-3 ring-1 ring-white/10">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-semibold text-neutral-100">Audio</div>
+                  <div className="flex items-center gap-2 text-xs text-neutral-300">
+                    <span className="rounded-full bg-white/10 px-2 py-0.5 ring-1 ring-white/10">
+                      Gain {gainDb.toFixed(1)} dB
+                    </span>
+                    {isClipping && (
+                      <span className="rounded-full bg-red-500/20 px-2 py-0.5 font-semibold text-red-200 ring-1 ring-red-500/30">
+                        CLIP
+                      </span>
+                    )}
+                    {!isAudioMeterEnabled && (
+                      <button
+                        type="button"
+                        onClick={enableAudioMeter}
+                        className="rounded-full bg-white/10 px-2 py-0.5 font-semibold text-neutral-100 ring-1 ring-white/10 transition hover:bg-white/15"
+                        title="Browsers often require a gesture to start the audio meter"
+                      >
+                        Enable meter
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="mt-3 space-y-2">
+                  <div className="flex items-center justify-between gap-3 text-xs text-neutral-300">
+                    <div className="font-medium">Level (RMS)</div>
+                    <div className="tabular-nums">
+                      {formatDb(ampToDbfs(rms))} dBFS • Peak {formatDb(ampToDbfs(peak))} dBFS
+                    </div>
+                  </div>
+
+                  <div className="relative">
+                    <Progress.Root
+                      value={rmsPct}
+                      className="relative h-2 w-full overflow-hidden rounded-full bg-white/10 ring-1 ring-white/10"
+                    >
+                      <Progress.Indicator
+                        className="h-full w-full origin-left bg-emerald-400/80"
+                        style={{ transform: `translateX(-${100 - rmsPct}%)` }}
+                      />
+                    </Progress.Root>
+                    {/* Peak marker */}
+                    <div
+                      className="pointer-events-none absolute -top-1 bottom-[-4px] w-[2px] rounded bg-white/70 shadow-[0_0_12px_rgba(255,255,255,0.35)]"
+                      style={{ left: `${peakPct}%` }}
+                    />
+                    {/* Clip zone hint */}
+                    <div className="pointer-events-none absolute inset-y-0 right-0 w-[8%] rounded-r-full bg-red-500/10" />
+                  </div>
+
+                  <div className="mt-3">
+                    <div className="mb-2 flex items-center justify-between text-xs text-neutral-300">
+                      <span className="font-medium">Input gain</span>
+                      <span className="text-neutral-400">(-24 dB to +24 dB)</span>
+                    </div>
+                    <div onPointerDownCapture={enableAudioMeter}>
+                      <Slider.Root
+                        value={[gainDb]}
+                        min={-24}
+                        max={24}
+                        step={0.5}
+                        onValueChange={(v) => setGainDb(v?.[0] ?? 0)}
+                        className="relative flex h-5 w-full touch-none select-none items-center"
+                        aria-label="Input gain"
+                      >
+                        <Slider.Track className="relative h-2 w-full grow overflow-hidden rounded-full bg-white/10 ring-1 ring-white/10">
+                          <Slider.Range className="absolute h-full bg-sky-400/70" />
+                        </Slider.Track>
+                        <Slider.Thumb className="block h-5 w-5 rounded-full bg-white shadow-sm ring-2 ring-black/40 transition focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                      </Slider.Root>
+                    </div>
+                    <div className="mt-2 text-[11px] text-neutral-400">
+                      Tip: aim for peaks around -6 to -3 dBFS to avoid clipping.
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="text-sm text-neutral-200">
-                <div className="font-medium">1080p attempt • Compressor + 1.5× gain • Auto-download</div>
+                <div className="font-medium">1080p attempt • Compressor + adjustable gain • Auto-download</div>
                 <div className="mt-0.5 text-xs text-neutral-400">If MP4 isn’t supported, it saves as WebM.</div>
               </div>
 
