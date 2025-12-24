@@ -389,7 +389,18 @@ export default function VideoRecorder() {
         triggerDownload(blob, finalMime);
       };
 
-      recorder.start(250); // timeslice for steady chunking
+      // NOTE: Timeslicing (e.g. start(250)) produces fragmented outputs that we then
+      // concatenate into a single Blob. This is usually fine for WebM, but MP4
+      // fragmentation/concatenation is unreliable across browsers (especially mobile)
+      // and can lead to broken timestamps → staggered audio and pitch shifts.
+      //
+      // For MP4, record as one contiguous segment to preserve correct timing.
+      const isMp4 = (chosenMime || recorder.mimeType || "").toLowerCase().includes("mp4");
+      if (isMp4) {
+        recorder.start();
+      } else {
+        recorder.start(250); // steady chunking for WebM (and other formats)
+      }
       setIsRecording(true);
       startTimer();
     } catch (e) {
