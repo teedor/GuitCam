@@ -2,7 +2,7 @@
 
 Single-page, high-fidelity video recorder with:
 - Live camera preview (full-screen)
-- Real-time microphone processing via Web Audio (`DynamicsCompressorNode` + `GainNode` at 1.5×)
+- Raw microphone audio capture (no in-app processing)
 - `MediaRecorder` capture with mp4→webm fallback and high bitrate attempts (>= 2.5Mbps)
 - Recording timer + auto-download with timestamped filename
 
