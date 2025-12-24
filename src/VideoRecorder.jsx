@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 
 export default function VideoRecorder() {
   const videoRef = useRef(null);
+  const previewContainerRef = useRef(null);
 
   const streamRef = useRef(null); // camera+mic stream (raw)
   const recorderRef = useRef(null);
@@ -16,6 +17,8 @@ export default function VideoRecorder() {
   const [elapsedSec, setElapsedSec] = useState(0);
   const [error, setError] = useState("");
   const [isInitializing, setIsInitializing] = useState(false);
+  const [previewFitMode, setPreviewFitMode] = useState("contain"); // "contain" | "cover"
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   const supportsMediaRecorder = typeof window !== "undefined" && "MediaRecorder" in window;
 
@@ -332,14 +335,45 @@ export default function VideoRecorder() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    function onFsChange() {
+      setIsFullscreen(Boolean(document.fullscreenElement));
+    }
+    document.addEventListener("fullscreenchange", onFsChange);
+    onFsChange();
+    return () => document.removeEventListener("fullscreenchange", onFsChange);
+  }, []);
+
+  async function toggleFullscreen() {
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen?.();
+        return;
+      }
+      const el = previewContainerRef.current;
+      if (!el?.requestFullscreen) {
+        throw new Error("Fullscreen is not supported in this browser.");
+      }
+      await el.requestFullscreen();
+    } catch (e) {
+      setError(e?.message || "Failed to toggle fullscreen.");
+    }
+  }
+
   const canStart = isReady && !isRecording && !isInitializing && supportsMediaRecorder;
   const canStop = isRecording;
 
   return (
     <div className="relative h-[100dvh] w-full bg-neutral-950 text-neutral-100">
       {/* Video Preview */}
-      <div className="absolute inset-0">
-        <video ref={videoRef} className="h-full w-full object-cover" autoPlay playsInline muted />
+      <div ref={previewContainerRef} className="absolute inset-0 bg-black">
+        <video
+          ref={videoRef}
+          className={`h-full w-full ${previewFitMode === "cover" ? "object-cover" : "object-contain"}`}
+          autoPlay
+          playsInline
+          muted
+        />
         {/* Vignette for better contrast */}
         <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-black/55 via-black/10 to-black/60" />
       </div>
@@ -355,6 +389,23 @@ export default function VideoRecorder() {
           </div>
 
           <div className="flex items-center gap-3">
+            <div className="hidden items-center gap-2 sm:flex">
+              <button
+                onClick={() => setPreviewFitMode((m) => (m === "contain" ? "cover" : "contain"))}
+                className="rounded-xl bg-white/10 px-3 py-2 text-sm font-semibold text-neutral-100 ring-1 ring-white/10 transition hover:bg-white/15"
+                title={previewFitMode === "contain" ? "Switch to Fill (crop edges)" : "Switch to Fit (show full frame)"}
+                type="button"
+              >
+                {previewFitMode === "contain" ? "Fit" : "Fill"}
+              </button>
+              <button
+                onClick={toggleFullscreen}
+                className="rounded-xl bg-white/10 px-3 py-2 text-sm font-semibold text-neutral-100 ring-1 ring-white/10 transition hover:bg-white/15"
+                type="button"
+              >
+                {isFullscreen ? "Exit Full screen" : "Full screen"}
+              </button>
+            </div>
             {isRecording ? (
               <div className="inline-flex items-center gap-2 rounded-full bg-red-500/15 px-3 py-1 text-sm font-semibold text-red-200 ring-1 ring-red-500/30">
                 <span className="relative inline-flex h-2.5 w-2.5">
@@ -389,6 +440,23 @@ export default function VideoRecorder() {
                   className="rounded-xl bg-white/10 px-4 py-2 text-sm font-semibold text-neutral-100 ring-1 ring-white/10 transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   Retry
+                </button>
+
+                <button
+                  onClick={() => setPreviewFitMode((m) => (m === "contain" ? "cover" : "contain"))}
+                  className="rounded-xl bg-white/10 px-4 py-2 text-sm font-semibold text-neutral-100 ring-1 ring-white/10 transition hover:bg-white/15 sm:hidden"
+                  title={previewFitMode === "contain" ? "Switch to Fill (crop edges)" : "Switch to Fit (show full frame)"}
+                  type="button"
+                >
+                  {previewFitMode === "contain" ? "Fit" : "Fill"}
+                </button>
+
+                <button
+                  onClick={toggleFullscreen}
+                  className="rounded-xl bg-white/10 px-4 py-2 text-sm font-semibold text-neutral-100 ring-1 ring-white/10 transition hover:bg-white/15 sm:hidden"
+                  type="button"
+                >
+                  {isFullscreen ? "Exit Full screen" : "Full screen"}
                 </button>
 
                 {!isRecording ? (
