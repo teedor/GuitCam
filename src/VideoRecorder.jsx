@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as Progress from "@radix-ui/react-progress";
+import { useInstallPrompt } from "./useInstallPrompt.js";
 
 export default function VideoRecorder() {
   const videoRef = useRef(null);
@@ -27,6 +28,8 @@ export default function VideoRecorder() {
   const [peak, setPeak] = useState(0);
   const [isClipping, setIsClipping] = useState(false);
   const [isAudioMeterEnabled, setIsAudioMeterEnabled] = useState(false);
+
+  const { canInstall, promptToInstall } = useInstallPrompt();
 
   const supportsMediaRecorder = typeof window !== "undefined" && "MediaRecorder" in window;
 
@@ -496,6 +499,16 @@ export default function VideoRecorder() {
           </div>
 
           <div className="flex items-center gap-3">
+            {canInstall && (
+              <button
+                onClick={() => promptToInstall()}
+                className="hidden rounded-xl bg-emerald-500/90 px-3 py-2 text-sm font-bold text-emerald-950 shadow-sm ring-1 ring-emerald-300/30 transition hover:bg-emerald-400 sm:inline-flex"
+                type="button"
+                title="Install this app"
+              >
+                Install
+              </button>
+            )}
             <div className="hidden items-center gap-2 sm:flex">
               <button
                 onClick={() => setPreviewFitMode((m) => (m === "contain" ? "cover" : "contain"))}
@@ -601,6 +614,16 @@ export default function VideoRecorder() {
               </div>
 
               <div className="flex items-center gap-3">
+                {canInstall && (
+                  <button
+                    onClick={() => promptToInstall()}
+                    className="rounded-xl bg-emerald-500/90 px-4 py-2 text-sm font-bold text-emerald-950 shadow-sm ring-1 ring-emerald-300/30 transition hover:bg-emerald-400 sm:hidden"
+                    type="button"
+                    title="Install this app"
+                  >
+                    Install
+                  </button>
+                )}
                 <button
                   onClick={initMedia}
                   disabled={isRecording || isInitializing}
