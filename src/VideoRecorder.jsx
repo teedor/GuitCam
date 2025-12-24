@@ -1,10 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import * as Slider from "@radix-ui/react-slider";
 import * as Progress from "@radix-ui/react-progress";
 
 export default function VideoRecorder() {
   const videoRef = useRef(null);
-  const previewContainerRef = useRef(null);
+  const fullscreenContainerRef = useRef(null);
 
   const streamRef = useRef(null); // camera+mic stream (raw)
   const recorderRef = useRef(null);
@@ -12,8 +11,6 @@ export default function VideoRecorder() {
   const timerIntervalRef = useRef(null);
 
   const audioContextRef = useRef(null);
-  const audioDestinationRef = useRef(null);
-  const gainNodeRef = useRef(null);
   const analyserRef = useRef(null);
   const meterRafRef = useRef(null);
   const lastClipAtMsRef = useRef(0);
@@ -26,17 +23,12 @@ export default function VideoRecorder() {
   const [isInitializing, setIsInitializing] = useState(false);
   const [previewFitMode, setPreviewFitMode] = useState("contain"); // "contain" | "cover"
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [gainDb, setGainDb] = useState(3.5); // ~1.5x linear (previous default)
   const [rms, setRms] = useState(0);
   const [peak, setPeak] = useState(0);
   const [isClipping, setIsClipping] = useState(false);
   const [isAudioMeterEnabled, setIsAudioMeterEnabled] = useState(false);
 
   const supportsMediaRecorder = typeof window !== "undefined" && "MediaRecorder" in window;
-
-  function dbToLinear(db) {
-    return Math.pow(10, db / 20);
-  }
 
   function ampToDbfs(amp) {
     if (!Number.isFinite(amp) || amp <= 0) return Number.NEGATIVE_INFINITY;
@@ -113,8 +105,6 @@ export default function VideoRecorder() {
       // ignore
     } finally {
       audioContextRef.current = null;
-      audioDestinationRef.current = null;
-      gainNodeRef.current = null;
       analyserRef.current = null;
       lastClipAtMsRef.current = 0;
       meterLastUiUpdateMsRef.current = 0;
@@ -237,9 +227,11 @@ export default function VideoRecorder() {
           facingMode: "user"
         },
         audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: false // we'll do our own compressor+gain pipeline
+          // Request "raw" mic without browser processing.
+          // Note: Some mobile browsers may not honor all of these.
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
         }
       };
 
@@ -254,8 +246,7 @@ export default function VideoRecorder() {
         await videoRef.current.play().catch(() => {});
       }
 
-      // Prepare audio graph for gain control + meter (may remain suspended until user gesture)
-      ensureAudioGraph(stream);
+      // Audio meter graph is optional and only enabled on user gesture.
 
       setIsReady(true);
     } catch (e) {
@@ -273,8 +264,9 @@ export default function VideoRecorder() {
   }
 
   function ensureAudioGraph(rawStream) {
-    if (audioContextRef.current && audioDestinationRef.current && gainNodeRef.current && analyserRef.current) {
-      return audioDestinationRef.current.stream;
+    // Monitoring-only graph (does not feed MediaRecorder)
+    if (audioContextRef.current && analyserRef.current) {
+      return;
     }
 
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -291,32 +283,18 @@ export default function VideoRecorder() {
 
     const source = ctx.createMediaStreamSource(micOnly);
 
-    const compressor = ctx.createDynamicsCompressor();
-    compressor.threshold.value = -18;
-    compressor.knee.value = 12;
-    compressor.ratio.value = 4;
-    compressor.attack.value = 0.01;
-    compressor.release.value = 0.25;
-
-    const gain = ctx.createGain();
-    gain.gain.value = dbToLinear(gainDb);
-    gainNodeRef.current = gain;
-
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 2048;
     analyser.smoothingTimeConstant = 0.2;
     analyserRef.current = analyser;
 
-    const destination = ctx.createMediaStreamDestination();
-    audioDestinationRef.current = destination;
-
-    // Pipeline: mic -> compressor -> gain -> (analyser + destination)
-    source.connect(compressor);
-    compressor.connect(gain);
-    gain.connect(analyser);
-    gain.connect(destination);
-
-    return destination.stream;
+    // Connect to a non-audible sink so the analyser updates without
+    // routing microphone audio to speakers (avoids echo).
+    const silent = ctx.createGain();
+    silent.gain.value = 0;
+    source.connect(analyser);
+    analyser.connect(silent);
+    silent.connect(ctx.destination);
   }
 
   function guessExtensionFromMime(mimeType) {
@@ -356,16 +334,8 @@ export default function VideoRecorder() {
       // Ensure audio graph exists + meter can run (some browsers require a user gesture to start audio)
       await enableAudioMeter();
 
-      // Build/Reuse processed audio
-      const processedAudioStream = ensureAudioGraph(rawStream);
-
-      // Combine camera video + processed audio into a new stream for recording
-      const composedStream = new MediaStream([videoTrack, ...processedAudioStream.getAudioTracks()]);
-
-      // Resume context if needed
-      if (audioContextRef.current?.state === "suspended") {
-        await audioContextRef.current.resume().catch(() => {});
-      }
+      // Record raw camera video + raw microphone audio (no WebAudio processing).
+      const composedStream = new MediaStream([videoTrack, ...rawStream.getAudioTracks()]);
 
       const mimeType = pickMimeType();
 
@@ -442,20 +412,6 @@ export default function VideoRecorder() {
   }
 
   useEffect(() => {
-    const ctx = audioContextRef.current;
-    const gain = gainNodeRef.current;
-    if (!ctx || !gain) return;
-
-    // Smooth gain changes to avoid clicks.
-    const next = dbToLinear(gainDb);
-    try {
-      gain.gain.setTargetAtTime(next, ctx.currentTime, 0.01);
-    } catch {
-      gain.gain.value = next;
-    }
-  }, [gainDb]);
-
-  useEffect(() => {
     initMedia();
 
     return () => {
@@ -488,7 +444,7 @@ export default function VideoRecorder() {
         await document.exitFullscreen?.();
         return;
       }
-      const el = previewContainerRef.current;
+      const el = fullscreenContainerRef.current;
       if (!el?.requestFullscreen) {
         throw new Error("Fullscreen is not supported in this browser.");
       }
@@ -504,9 +460,9 @@ export default function VideoRecorder() {
   const peakPct = Math.max(0, Math.min(100, peak * 100));
 
   return (
-    <div className="relative h-[100dvh] w-full bg-neutral-950 text-neutral-100">
+    <div ref={fullscreenContainerRef} className="relative h-[100dvh] w-full bg-neutral-950 text-neutral-100">
       {/* Video Preview */}
-      <div ref={previewContainerRef} className="absolute inset-0 bg-black">
+      <div className="absolute inset-0 bg-black">
         <video
           ref={videoRef}
           className={`h-full w-full ${previewFitMode === "cover" ? "object-cover" : "object-contain"}`}
@@ -573,9 +529,6 @@ export default function VideoRecorder() {
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-sm font-semibold text-neutral-100">Audio</div>
                   <div className="flex items-center gap-2 text-xs text-neutral-300">
-                    <span className="rounded-full bg-white/10 px-2 py-0.5 ring-1 ring-white/10">
-                      Gain {gainDb.toFixed(1)} dB
-                    </span>
                     {isClipping && (
                       <span className="rounded-full bg-red-500/20 px-2 py-0.5 font-semibold text-red-200 ring-1 ring-red-500/30">
                         CLIP
@@ -622,26 +575,6 @@ export default function VideoRecorder() {
                   </div>
 
                   <div className="mt-3">
-                    <div className="mb-2 flex items-center justify-between text-xs text-neutral-300">
-                      <span className="font-medium">Input gain</span>
-                      <span className="text-neutral-400">(-24 dB to +24 dB)</span>
-                    </div>
-                    <div onPointerDownCapture={enableAudioMeter}>
-                      <Slider.Root
-                        value={[gainDb]}
-                        min={-24}
-                        max={24}
-                        step={0.5}
-                        onValueChange={(v) => setGainDb(v?.[0] ?? 0)}
-                        className="relative flex h-5 w-full touch-none select-none items-center"
-                        aria-label="Input gain"
-                      >
-                        <Slider.Track className="relative h-2 w-full grow overflow-hidden rounded-full bg-white/10 ring-1 ring-white/10">
-                          <Slider.Range className="absolute h-full bg-sky-400/70" />
-                        </Slider.Track>
-                        <Slider.Thumb className="block h-5 w-5 rounded-full bg-white shadow-sm ring-2 ring-black/40 transition focus:outline-none focus:ring-2 focus:ring-sky-300" />
-                      </Slider.Root>
-                    </div>
                     <div className="mt-2 text-[11px] text-neutral-400">
                       Tip: aim for peaks around -6 to -3 dBFS to avoid clipping.
                     </div>
@@ -652,7 +585,7 @@ export default function VideoRecorder() {
 
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="text-sm text-neutral-200">
-                <div className="font-medium">1080p attempt • Compressor + adjustable gain • Auto-download</div>
+                <div className="font-medium">1080p attempt • Raw mic audio • Auto-download</div>
                 <div className="mt-0.5 text-xs text-neutral-400">If MP4 isn’t supported, it saves as WebM.</div>
               </div>
 
